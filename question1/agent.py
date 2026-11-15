@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
@@ -43,44 +42,28 @@ Example ticket resolutions (format to copy):
 
 
 class SupportCopilot:
-    """
-    ShopAssist Tier-1 copilot (baseline).
-
-    Given a support ticket + order snapshot, choose an action, cite the help-center
-    article, and draft the customer reply.
-    """
-
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
+        # built once, same text every time, so it can be cached
+        self._system = "\n\n".join(
+            [
+                "You are ShopAssist, the Tier-1 customer support copilot.",
+                _FEW_SHOT,
+                "HELP CENTER:",
+                all_articles_blob(),
+                'Reply with ONLY one line of JSON: {"action":"...","kb_article":"..."}. '
+                "No reasoning, no extra text.",
+            ]
+        )
 
     def build_messages(self, ticket_id: str) -> list[ChatMessage]:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
-
-        system = "\n\n".join(
-            [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
-            ]
-        )
-        user = "\n\n".join(
-            [
-                f"TICKET_ID: {ticket_id}",
-                f"THREAD:\n{thread}",
-                f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ]
-        )
-        return [ChatMessage("system", system), ChatMessage("user", user)]
+        snapshot = json.dumps(order, separators=(",", ":"))
+        user = f"TICKET_ID: {ticket_id}\nTHREAD:\n{thread}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT"
+        return [ChatMessage("system", self._system), ChatMessage("user", user)]
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         messages = self.build_messages(ticket_id)

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import json
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import expanded_help_center_blob, title_index
+from shared.kb import all_articles_blob, article_ids
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
 from question1.agent import parse_resolution
+
+ALLOWED_ACTIONS = {"REFUND", "REPLACE", "SEND_ARTICLE", "ESCALATE_TIER2"}
 
 
 @dataclass
@@ -19,115 +20,54 @@ class TicketResolution:
 
 
 class SupportPipeline:
-    """Same product as Question 1 — triage, retrieve, compose, audit."""
+    """Triage and audit are plain code; the help center is a cached prefix;
+    only one LLM call is made per ticket."""
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
-        self.help_center = expanded_help_center_blob()
+        # Static and identical for every ticket, so it can be cached.
+        # Real articles only: the padding notes in the expanded blob say
+        # they do not change policy, so they are not sent.
+        self._system = "\n\n".join(
+            [
+                "You are ShopAssist, a Tier-1 support agent.",
+                "Allowed actions: REFUND, REPLACE, SEND_ARTICLE, ESCALATE_TIER2. "
+                "kb_article must be the id of one help-center article.",
+                "HELP CENTER:",
+                all_articles_blob(),
+                'Reply with ONLY one line of JSON: {"action":"...","kb_article":"..."}. '
+                "No other text.",
+            ]
+        )
+        self._cached_prefix = "SYSTEM:\n" + self._system
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
+        case = self._triage(ticket_id)
+        raw = self._compose(case)
+        return self._audit(raw)
+
+    def _triage(self, ticket_id: str) -> str:
+        """No LLM: just build a compact case description."""
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
+        snapshot = json.dumps(order, separators=(",", ":"))
+        return (
+            f"TICKET_ID: {ticket_id}\nTHREAD:\n{thread}\n"
+            f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT"
+        )
 
-        triage = self._triage(ticket_id, thread, snapshot)
-        retrieved = self._retrieve(triage, snapshot)
-        draft = self._compose(ticket_id, thread, snapshot, triage, retrieved)
-        final = self._audit(ticket_id, thread, snapshot, triage, retrieved, draft)
-        parsed = parse_resolution(final)
+    def _compose(self, case: str) -> str:
+        """The only LLM call."""
+        messages = [ChatMessage("system", self._system), ChatMessage("user", case)]
+        return self.llm.chat("compose", messages, cached_prefix=self._cached_prefix)
+
+    def _audit(self, raw: str) -> TicketResolution:
+        """No LLM: validate the answer with code."""
+        parsed = parse_resolution(raw)
+        if parsed.action not in ALLOWED_ACTIONS:
+            raise ValueError(f"Invalid action: {parsed.action}")
+        if parsed.kb_article not in article_ids():
+            raise ValueError(f"Unknown article: {parsed.kb_article}")
         return TicketResolution(parsed.action, parsed.kb_article)
-
-    def _triage(self, ticket_id: str, thread: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "\n".join(
-                    [
-                        f"trace-{uuid.uuid4()}",
-                        "Triage node: restate the ticket step by step and list candidate kb articles.",
-                        f"ARTICLE TITLES:\n{title_index(500)}",
-                        self.help_center[:120_000],
-                    ]
-                ),
-            ),
-            ChatMessage(
-                "user",
-                f"TICKET {ticket_id}\nTHREAD:\n{thread}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("triage", messages)
-
-    def _retrieve(self, triage: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Retrieve node: print full text of the eight most relevant help articles.",
-            ),
-            ChatMessage(
-                "user",
-                f"TRIAGE:\n{triage}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("retrieve", messages)
-
-    def _compose(
-        self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Compose node: full reasoning, then JSON with action, kb_article, customer_reply.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                        f"TRIAGE AGAIN:\n{triage}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("compose", messages)
-
-    def _audit(
-        self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
-        draft: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Audit node: double-check policy, restate ticket, rewrite JSON output.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        self.help_center[:80_000],
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"DRAFT:\n{draft}",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("audit", messages)
